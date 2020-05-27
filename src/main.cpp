@@ -1,17 +1,19 @@
 #include <Arduino.h>
+#include <util/delay.h>
 #include <SoftwareSerial.h>
 
 SoftwareSerial mySerial(PB0, PB1);
 
 #include "button.c"
+#include "pump.c"
 #include "adc.c"
+
 #include "statemachine.cpp"
 
-Statemachine statemachine(mySerial);
+Env env;
+Statemachine statemachine(&env);
 
 #include "timer.c"
-
-volatile uint16_t moisture_value = 0;
 
 void setup() {
     // Disable global interrupts for a init phase
@@ -24,6 +26,7 @@ void setup() {
 
     adc_init();
     timer_init();
+    pump_init();
     button_init();
 
     // Activate global interrupts again

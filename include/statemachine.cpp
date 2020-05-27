@@ -1,11 +1,21 @@
 #include "statemachine.h"
 
-void print_config(Config* config) {
-    mySerial.print("Config: button_pressed_tick_count=");
-    mySerial.print(config->button_pressed_tick_count);
-    mySerial.print(", adc_value_drained=");
-    mySerial.print(config->adc_value_drained);
-    mySerial.print("\n");
+void print_info(Env& env, uint16_t adc_value, State* state) {
+    env.print("State=");
+    env.print(state->name());
+    env.print(", Moisture=");
+    env.print(adc_value);
+    env.print(", Pumping=");
+    env.print(env.pump_is_active());
+
+    if (state->config()) {
+        env.print(" -- button_pressed_tick_count=");
+        env.print(state->config()->button_pressed_tick_count);
+        env.print(", adc_value_drained=");
+        env.print(state->config()->adc_value_drained);
+    }
+
+    env.print("\n");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -13,26 +23,40 @@ void print_config(Config* config) {
 ////////////////////////////////////////////////////////////////////////////////
 
 void Statemachine::init() {
-    _state = new UninitializedState();
+    _state = new UninitializedState(_env);
 };
 
 void Statemachine::do_state_transition(State* next_state) {
     if (next_state != _state) {
+        _env.disable_interrupts();
+
+        _env.print("PreviousState=");
+        _env.print(_state->name());
+        _env.print(", NextState=");
+        _env.print(next_state->name());
+        _env.print("\n");
+
         auto previous_state = _state;
         this->_state = next_state;
+        previous_state->on_state_deactivation();
+        next_state->on_state_activation();
+
         delete previous_state;
+        
+        _env.enable_interrupts();
     }
 };
 
 void Statemachine::on_timer_tick() {
+    uint16_t adc_value = _env.adc_measure_value_averaged();
     if (_last_print_tick_count >= PRINT_EVERY_N_TICKS) {
         _last_print_tick_count = 0;
-        this->_state->serial_print(this->_softwareSerial);
+        print_info(this->_env, adc_value, this->_state);
     } else {
         _last_print_tick_count++;
     }
 
-    auto next_state = this->_state->on_timer_tick();
+    auto next_state = this->_state->on_timer_tick(adc_value);
     do_state_transition(next_state);
 };
 
@@ -40,43 +64,100 @@ void Statemachine::on_timer_tick() {
 // Uninitialized State
 ////////////////////////////////////////////////////////////////////////////////
 
-void UninitializedState::serial_print(SoftwareSerial& softwareSerial) {
-  mySerial.print("UninitializedState: Moisture: ");
-  mySerial.print(adc_measure_value_averaged());
-  mySerial.print("\n");
+const char* UninitializedState::name() {
+  return "Uninitialized";
 };
 
-State* UninitializedState::on_timer_tick() {
-    if (button_is_pressed()) {
-        if (_config->button_pressed_tick_count == 0) {
-            _config->adc_value_drained = adc_measure_value_averaged();
-        }
+Config* UninitializedState::config() {
+  return NULL;
+};
 
-        _config->button_pressed_tick_count++;
-    }
-    else if (_config->button_pressed_tick_count > 0) {
-        return new DrainingState(_config);
+State* UninitializedState::on_timer_tick(uint16_t adc_value) {
+    if (_env.button_is_pressed()) {
+        return new InitializingState(_env, adc_value);
     }
     return this;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
+// Initializing State
+////////////////////////////////////////////////////////////////////////////////
+
+const char* InitializingState::name() {
+  return "Initializing";
+};
+
+
+Config* InitializingState::config() {
+  return NULL;
+};
+
+void InitializingState::on_state_activation() {
+    _env.pump_start();
+};
+
+void InitializingState::on_state_deactivation() {
+    _env.pump_stop();
+};
+
+State* InitializingState::on_timer_tick(uint16_t adc_value) {
+    if (_env.button_is_pressed()) {
+        _button_pressed_tick_count++;
+    }
+    else {
+        Config* config = new Config();
+        config->adc_value_drained = _adc_value_drained;
+        config->button_pressed_tick_count = _button_pressed_tick_count;
+
+        return new WateredState(_env, config);
+    }
+
+    return this;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// Watered State
+////////////////////////////////////////////////////////////////////////////////
+
+const char* WateredState::name() {
+    return "Watered";
+};
+
+Config* WateredState::config() {
+  return _config;
+};
+
+void WateredState::on_state_activation() {
+    _min_adc_value = _env.adc_measure_value_averaged();
+};
+
+State* WateredState::on_timer_tick(uint16_t adc_value) {
+    if (adc_value < _min_adc_value) {
+        _min_adc_value = adc_value;
+    } else if (adc_value > _min_adc_value + ADC_TOLERANCE) {
+        return new DrainingState(_env, _config);
+    }
+
+    return this;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////
 // Draining State
 ////////////////////////////////////////////////////////////////////////////////
 
-void DrainingState::serial_print(SoftwareSerial& softwareSerial) {
-    mySerial.print("DrainingState: Moisture: ");
-    mySerial.print(adc_measure_value_averaged());
-    mySerial.print("\n");
+const char* DrainingState::name() {
+    return "Draining";
 };
 
-State* DrainingState::on_timer_tick() {
-    if (button_is_pressed()) {
-        print_config(_config);
-    }
+Config* DrainingState::config() {
+  return _config;
+};
 
-    if (adc_measure_value_averaged() < _config->adc_value_drained) {
-        
+State* DrainingState::on_timer_tick(uint16_t adc_value) {
+    if (adc_value > _config->adc_value_drained + ADC_TOLERANCE) {
+        // TODO WATER
+        return new WateredState(_env, _config);
     }
 
     return this;
